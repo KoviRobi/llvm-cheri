@@ -1,4 +1,5 @@
 #include "llvm/Support/Endian.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Object/ELFObjectFile.h"
 #include <unordered_map>
@@ -6,6 +7,7 @@
 
 using namespace llvm;
 using namespace llvm::object;
+using llvm::sys::fs::mapped_file_region;
 
 static const std::string SizePrefix = ".size.";
 
@@ -19,9 +21,22 @@ int main(int argc, char *argv[]) {
   std::vector<std::tuple<uint64_t, uint64_t, bool>> Sections;
   // ObjectFile doesn't allow in-place modification, so we open the file again
   // and write it out.
-  FILE *F = fopen(argv[1], "r+");
-  if (!F) {
-    fprintf(stderr, "Cannot open %s\n", argv[1]);
+  int FD;
+  if (auto Err = sys::fs::openFileForWrite(argv[1], FD,
+        sys::fs::OpenFlags::F_RW | sys::fs::OpenFlags::F_Append)) {
+    fprintf(stderr, "%s: Cannot open %s: %s\n", argv[0], argv[1], Err.message().c_str());
+    return EXIT_FAILURE;
+  }
+  sys::fs::file_status Stat;
+  if (auto Err = sys::fs::status(FD, Stat)) {
+    fprintf(stderr, "%s: Cannot stat %s: %s\n", argv[0], argv[1], Err.message().c_str());
+    return EXIT_FAILURE;
+  }
+  auto Len = Stat.getSize();
+  std::error_code Err;
+  mapped_file_region MF(FD, mapped_file_region::readwrite, Len, 0, Err);
+  if (Err) {
+    fprintf(stderr, "%s: Cannot mmap %s: %s\n", argv[0], argv[1], Err.message().c_str());
     return EXIT_FAILURE;
   }
   StringMap<uint64_t> SizeForName;
@@ -83,13 +98,14 @@ int main(int argc, char *argv[]) {
             (std::get<0>(Sec) + std::get<1>(Sec)) > base) {
           Size = std::get<1>(Sec);
           isFunction = std::get<2>(Sec);
-          if (!isFunction)
+          if (!isFunction) {
             fprintf(stderr, "Unable to find size of symbol at 0%llx for pointer at 0x%llx\n"
                     "Using section size (%llu bytes) instead\n",
                     (unsigned long long)base,
                     static_cast<unsigned long long>(
                         support::endian::read<uint64_t, support::big, 1>(entry)),
                     static_cast<unsigned long long>(Size));
+          }
           break; // First match wins
         }
       }
@@ -112,9 +128,10 @@ int main(int argc, char *argv[]) {
     uint64_t BigPerms =
         support::endian::byte_swap<uint64_t, support::big>(Perms);
     // This is an ugly hack.  object ought to allow modification
-    fseek(F, entry - MB.getBufferStart() + 24, SEEK_SET);
-    fwrite(&BigSize, sizeof(BigSize), 1, F);
-    fwrite(&BigPerms, sizeof(BigPerms), 1, F);
+    auto Offset = entry - MB.getBufferStart() + 24;
+    memcpy(MF.data() + Offset, &BigSize, sizeof(BigSize));
+    Offset += sizeof(BigSize);
+    memcpy(MF.data() + Offset, &BigPerms, sizeof(BigPerms));
   }
   if (SizesSection != SectionRef()) {
     SizesSection.getContents(Data);
@@ -136,11 +153,9 @@ int main(int argc, char *argv[]) {
 #ifndef NDEBUG
       fprintf(stderr, "Writing size %llu for symbol %s\n", (unsigned long long)Size, Name.c_str());
 #endif
-      fseek(F, SectionOffset + offset, SEEK_SET);
       uint64_t BigSize =
           support::endian::byte_swap<uint64_t, support::big>(Size);
-      fwrite(&BigSize, sizeof(BigSize), 1, F);
+      memcpy(MF.data() + SectionOffset + offset, &BigSize, sizeof(BigSize));
     }
   }
-  fclose(F);
 }
